@@ -8,7 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Helper: Calculate bearing angle between two coordinates (in degrees)
+// Helper 1: Calculate initial bearing between two GPS coordinates (in degrees 0-360)
 function calculateBearing(startLat, startLng, destLat, destLng) {
   const startLatRad = (startLat * Math.PI) / 180;
   const destLatRad = (destLat * Math.PI) / 180;
@@ -23,6 +23,21 @@ function calculateBearing(startLat, startLng, destLat, destLng) {
   return ((bearingRad * 180) / Math.PI + 360) % 360;
 }
 
+// Helper 2: Calculate distance between two GPS points in meters (Haversine Formula)
+function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // Earth radius in meters
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
+
 app.post('/api/v1/predict-shade', async (req, res) => {
   try {
     const { origin_lat, origin_lng, dest_lat, dest_lng, departure_time, via_lat, via_lng } = req.body;
@@ -34,7 +49,7 @@ app.post('/api/v1/predict-shade', async (req, res) => {
       });
     }
 
-    // 1. Construct OSRM URL (supports optional via-waypoint for exact highway targeting)
+    // 1. Build OSRM route URL
     let coordinatesPath = `${origin_lng},${origin_lat}`;
     if (via_lat && via_lng) {
       coordinatesPath += `;${via_lng},${via_lat}`;
@@ -50,52 +65,100 @@ app.post('/api/v1/predict-shade', async (req, res) => {
 
     const routeData = routeResponse.data.routes[0];
     const carDurationSeconds = routeData.duration;
-    const coordinates = routeData.geometry.coordinates;
+    const coordinates = routeData.geometry.coordinates; // Array of [lng, lat]
 
-    // 2. BUS SPEED CALIBRATION:
-    // OSRM outputs car speeds (~80-100 km/h). Commercial buses average ~50-55 km/h including stops.
-    // Factor 1.55 scales a ~4-hour car run to a realistic ~6.5-7 hour intercity bus schedule.
+    // Bus speed correction factor (1.55x for intercity transit)
     const BUS_SPEED_FACTOR = 1.55;
     const busDurationSeconds = carDurationSeconds * BUS_SPEED_FACTOR;
+    const totalDistanceMeters = routeData.distance;
 
     const startTime = new Date(departure_time);
-    let leftShadeSum = 0;
+
+    let rightShadeTimeSeconds = 0;
+    let leftShadeTimeSeconds = 0;
+    let totalSampledTimeSeconds = 0;
+
     const segmentCount = coordinates.length - 1;
 
-    // 3. Evaluate solar position along each road segment based on adjusted bus time
+    // First pass: calculate total geometry distance across segments
+    let totalGeometryMeters = 0;
+    const segmentDistances = [];
+    for (let i = 0; i < segmentCount; i++) {
+      const [startLng, startLat] = coordinates[i];
+      const [endLng, endLat] = coordinates[i + 1];
+      const dist = calculateDistanceMeters(startLat, startLng, endLat, endLng);
+      segmentDistances.push(dist);
+      totalGeometryMeters += dist;
+    }
+
+    let accumulatedTimeSeconds = 0;
+
+    // 2. Evaluate each road segment mathematically weighted by time
     for (let i = 0; i < segmentCount; i++) {
       const [startLng, startLat] = coordinates[i];
       const [endLng, endLat] = coordinates[i + 1];
 
-      const segmentBearing = calculateBearing(startLat, startLng, endLat, endLng);
+      const segmentDist = segmentDistances[i];
+      if (segmentDist === 0) continue;
+
+      // Fraction of total journey time spent on this segment
+      const segmentTimeFraction = totalGeometryMeters > 0 ? segmentDist / totalGeometryMeters : 1 / segmentCount;
+      const segmentDurationSeconds = busDurationSeconds * segmentTimeFraction;
+
+      // Time at the midpoint of this segment
+      const segmentMidpointTime = new Date(startTime.getTime() + (accumulatedTimeSeconds + segmentDurationSeconds / 2) * 1000);
+      accumulatedTimeSeconds += segmentDurationSeconds;
+
+      // Bus heading direction (0° = North, 90° = East, 180° = South, 270° = West)
+      const busHeading = calculateBearing(startLat, startLng, endLat, endLng);
+
+      // Get accurate solar coordinates using SunCalc
+      const sunPos = SunCalc.getPosition(segmentMidpointTime, startLat, startLng);
       
-      // Calculate exact time the bus passes this segment
-      const progressRatio = i / segmentCount;
-      const segmentTime = new Date(startTime.getTime() + (busDurationSeconds * 1000 * progressRatio));
+      // SunCalc returns azimuth in radians measured from South (-pi to +pi).
+      // Standard geographic azimuth: 0° = North, 90° = East, 180° = South, 270° = West.
+      const sunAzimuthDeg = ((sunPos.azimuth * (180 / Math.PI)) + 180) % 360;
+      const sunElevationDeg = sunPos.altitude * (180 / Math.PI);
 
-      // Compute solar azimuth at segment location and time
-      const sunPos = SunCalc.getPosition(segmentTime, startLat, startLng);
-      const sunAzimuthDeg = (sunPos.azimuth * (180 / Math.PI) + 180) % 360;
-
-      // Compute relative angle of sun relative to bus heading
-      let relativeAngle = (sunAzimuthDeg - segmentBearing + 360) % 360;
-
-      // Relative angle 180° to 360° = Sun on Left (Right gets shade)
-      // Relative angle 0° to 180° = Sun on Right (Left gets shade)
-      if (relativeAngle > 180) {
-        leftShadeSum += 100;
+      // If the sun is below the horizon (night travel), no direct sun hits either side
+      if (sunElevationDeg <= 0) {
+        leftShadeTimeSeconds += segmentDurationSeconds / 2;
+        rightShadeTimeSeconds += segmentDurationSeconds / 2;
+        totalSampledTimeSeconds += segmentDurationSeconds;
+        continue;
       }
+
+      // Mathematical Relative Azimuth (Sun angle relative to Bus Heading)
+      // 0° = Sun directly in front
+      // 90° = Sun directly on the RIGHT side of bus (Right gets sun -> LEFT gets shade)
+      // 180° = Sun directly behind
+      // 270° = Sun directly on the LEFT side of bus (Left gets sun -> RIGHT gets shade)
+      const relativeSunAngle = (sunAzimuthDeg - busHeading + 360) % 360;
+
+      if (relativeSunAngle > 0 && relativeSunAngle < 180) {
+        // Sun is on the RIGHT side of the bus -> LEFT side is shaded
+        leftShadeTimeSeconds += segmentDurationSeconds;
+      } else if (relativeSunAngle > 180 && relativeSunAngle < 360) {
+        // Sun is on the LEFT side of the bus -> RIGHT side is shaded
+        rightShadeTimeSeconds += segmentDurationSeconds;
+      } else {
+        // Sun directly ahead or behind -> split evenly
+        leftShadeTimeSeconds += segmentDurationSeconds / 2;
+        rightShadeTimeSeconds += segmentDurationSeconds / 2;
+      }
+
+      totalSampledTimeSeconds += segmentDurationSeconds;
     }
 
-    const avgLeftShade = Math.round(leftShadeSum / segmentCount);
+    const avgLeftShade = Math.round((leftShadeTimeSeconds / totalSampledTimeSeconds) * 100);
     const avgRightShade = 100 - avgLeftShade;
-    const recommendedSide = avgLeftShade >= 50 ? 'LEFT' : 'RIGHT';
+    const recommendedSide = avgLeftShade >= avgRightShade ? 'LEFT' : 'RIGHT';
 
     return res.json({
       status: 'success',
-      engine: 'SolSide-v2-Predictive',
+      engine: 'SolSide-v3-Universal-Vector',
       route_details: {
-        distance_km: (routeData.distance / 1000).toFixed(2),
+        distance_km: (totalDistanceMeters / 1000).toFixed(2),
         estimated_bus_duration_minutes: Math.round(busDurationSeconds / 60),
         estimated_bus_duration_hours: (busDurationSeconds / 3600).toFixed(1)
       },
