@@ -8,6 +8,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Helper 1: Calculate initial bearing between two GPS coordinates (in degrees 0-360)
 function calculateBearing(startLat, startLng, destLat, destLng) {
   const startLatRad = (startLat * Math.PI) / 180;
   const destLatRad = (destLat * Math.PI) / 180;
@@ -22,8 +23,9 @@ function calculateBearing(startLat, startLng, destLat, destLng) {
   return ((bearingRad * 180) / Math.PI + 360) % 360;
 }
 
+// Helper 2: Calculate distance between two GPS points in meters (Haversine Formula)
 function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
-  const R = 6371000;
+  const R = 6371000; // Earth radius in meters
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
   const dLon = ((lon2 - lon1) * Math.PI) / 180;
   const a =
@@ -36,7 +38,7 @@ function calculateDistanceMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-app.post('/api/v1/predict-shade', async (req, res) => {
+app.post('/api/v1/predict-shade', async, async (req, res) => {
   try {
     const { origin_lat, origin_lng, dest_lat, dest_lng, departure_time, via_lat, via_lng } = req.body;
 
@@ -47,6 +49,7 @@ app.post('/api/v1/predict-shade', async (req, res) => {
       });
     }
 
+    // 1. Build OSRM route URL
     let coordinatesPath = `${origin_lng},${origin_lat}`;
     if (via_lat && via_lng) {
       coordinatesPath += `;${via_lng},${via_lat}`;
@@ -62,8 +65,9 @@ app.post('/api/v1/predict-shade', async (req, res) => {
 
     const routeData = routeResponse.data.routes[0];
     const carDurationSeconds = routeData.duration;
-    const coordinates = routeData.geometry.coordinates;
+    const coordinates = routeData.geometry.coordinates; // Array of [lng, lat]
 
+    // Bus speed correction factor (1.55x for intercity transit)
     const BUS_SPEED_FACTOR = 1.55;
     const busDurationSeconds = carDurationSeconds * BUS_SPEED_FACTOR;
     const totalDistanceMeters = routeData.distance;
@@ -88,6 +92,7 @@ app.post('/api/v1/predict-shade', async (req, res) => {
 
     let accumulatedTimeSeconds = 0;
 
+    // 2. Evaluate each road segment using 2D Cross-Product Vector Analysis
     for (let i = 0; i < segmentCount; i++) {
       const [startLng, startLat] = coordinates[i];
       const [endLng, endLat] = coordinates[i + 1];
@@ -101,38 +106,47 @@ app.post('/api/v1/predict-shade', async (req, res) => {
       const segmentMidpointTime = new Date(startTime.getTime() + (accumulatedTimeSeconds + segmentDurationSeconds / 2) * 1000);
       accumulatedTimeSeconds += segmentDurationSeconds;
 
-      const busHeading = calculateBearing(startLat, startLng, endLat, endLng);
-
+      // Get accurate solar coordinates using SunCalc
       const sunPos = SunCalc.getPosition(segmentMidpointTime, startLat, startLng);
       const sunAzimuthDeg = ((sunPos.azimuth * (180 / Math.PI)) + 180) % 360;
       const sunElevationDeg = sunPos.altitude * (180 / Math.PI);
 
-      // CRITICAL FIX: Skip solar calculations when the sun is below the horizon
+      // Skip night-time segments where sun is below horizon
       if (sunElevationDeg <= 0) {
-        continue; // Do not count night segments as daylight shade
+        continue;
       }
 
       daylightTimeSeconds += segmentDurationSeconds;
 
-      const relativeSunAngle = (sunAzimuthDeg - busHeading + 360) % 360;
+      // 2D Vector Components
+      const busDx = endLng - startLng; // East/West travel vector component
+      const busDy = endLat - startLat; // North/South travel vector component
 
-      if (relativeSunAngle > 0 && relativeSunAngle < 180) {
-        // Sun on RIGHT side -> LEFT side is shaded
-        leftShadeTimeSeconds += segmentDurationSeconds;
-      } else if (relativeSunAngle > 180 && relativeSunAngle < 360) {
-        // Sun on LEFT side -> RIGHT side is shaded
+      const sunAzimuthRad = (sunAzimuthDeg * Math.PI) / 180;
+      const sunX = Math.sin(sunAzimuthRad); // Sun East component
+      const sunY = Math.cos(sunAzimuthRad); // Sun North component
+
+      // 2D Cross Product (Determinant) to find relative side placement unambiguously
+      const crossProduct = (busDx * sunY) - (busDy * sunX);
+
+      if (crossProduct > 0.00001) {
+        // Sun is to the LEFT of the bus heading -> RIGHT side is shaded
         rightShadeTimeSeconds += segmentDurationSeconds;
+      } else if (crossProduct < -0.00001) {
+        // Sun is to the RIGHT of the bus heading -> LEFT side is shaded
+        leftShadeTimeSeconds += segmentDurationSeconds;
       } else {
+        // Split evenly if perfectly aligned
         leftShadeTimeSeconds += segmentDurationSeconds / 2;
         rightShadeTimeSeconds += segmentDurationSeconds / 2;
       }
     }
 
-    // CHECK FOR NIGHT TRIP: If entire trip happens when sun is below horizon
+    // Handle Night Trips (Zero daylight hours detected)
     if (daylightTimeSeconds === 0) {
       return res.json({
         status: 'success',
-        engine: 'SolSide-v3.1-NightAware',
+        engine: 'SolSide-v3.2-VectorCross',
         is_night_trip: true,
         route_details: {
           distance_km: (totalDistanceMeters / 1000).toFixed(2),
@@ -152,7 +166,7 @@ app.post('/api/v1/predict-shade', async (req, res) => {
 
     return res.json({
       status: 'success',
-      engine: 'SolSide-v3.1-NightAware',
+      engine: 'SolSide-v3.2-VectorCross',
       is_night_trip: false,
       route_details: {
         distance_km: (totalDistanceMeters / 1000).toFixed(2),
